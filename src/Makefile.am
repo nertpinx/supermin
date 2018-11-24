@@ -54,6 +54,8 @@ SOURCES = \
 	ph_dpkg.mli \
 	ph_pacman.ml \
 	ph_pacman.mli \
+	ph_portage.ml \
+	ph_portage.mli \
 	mode_prepare.ml \
 	mode_prepare.mli \
 	format_chroot.ml \
@@ -86,6 +88,7 @@ SOURCES_ML = \
 	ph_rpm.ml \
 	ph_dpkg.ml \
 	ph_pacman.ml \
+	ph_portage.ml \
 	mode_prepare.ml \
 	format_chroot.ml \
 	format_ext2_init.ml \

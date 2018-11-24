@@ -126,6 +126,10 @@ AC_PATH_PROG(PACMAN,[pacman],[no])
 AC_PATH_PROG(PACTREE,[pactree],[no])
 AC_PATH_PROG(MAKEPKG,[makepkg],[no])
 
+dnl For Portage handler.
+AC_PATH_PROG(PORTAGEQ,[portageq],[no])
+AC_PATH_PROG(QTBZ2,[qtbz2],[no])
+
 dnl Check for fakeroot, only used a few drivers where the host package
 dnl manager contains broken/unnecessary tests for root privs.
 AC_PATH_PROG(FAKEROOT,[fakeroot],[no])
