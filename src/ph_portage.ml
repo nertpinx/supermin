@@ -22,6 +22,8 @@ open Printf
 open Utils
 open Package_handler
 
+let db_path = "/var/db/pkg"
+
 let portage_detect () =
   Config.portageq <> "no" &&
   Config.qtbz2 <> "no" &&
@@ -30,6 +32,9 @@ let portage_detect () =
 
 let settings = ref no_settings
 
+let portage_init s =
+  settings := s;
+
 type portage_pkg_t = {
   category : string;
   name : string;
@@ -37,25 +42,55 @@ type portage_pkg_t = {
 }
 
 let portage_pkg_to_str pkg =
-  Printf.sprintf "%s/%s-%s" pkg.category pkg.name pkg.version
+  sprintf "%s/%s-%s" pkg.category pkg.name pkg.version
 
+(* Parses ">=category/name-version[rest]" as well as just "name-version" *)
 let parse_pv pf =
-  let len = Str.search_forward (Str.regexp "-[0-9]") pf 0 in
+  let get_two exp x = Str.bounded_split (Str.regexp exp) x 2 in
+  let tmp = get_two "/" pf in
+  let category =
+    if List.length tmp = 2 then
+      let ctmp = List.hd tmp in
+      let len = Str.search_forward (Str.regexp "[a-zA-Z]") ctmp 0 in
+      String.sub ctmp len (String.length ctmp - len)
+    else "" in
+  let tmp = if List.length tmp = 2 then List.hd @@ List.tl @@ tmp else List.hd tmp in
+  let len = Str.search_forward (Str.regexp "-[0-9]") tmp 0 in
+  let name = String.sub tmp 0 len in
   let len = len + 1 in
-  String.sub pf 0 len, String.sub pf len (String.length pf - len)
+  let tmp = String.sub tmp len (String.length tmp - len) in
+  let tmp = get_two "[:[]" tmp in
+  let version = List.hd tmp in
+  category, name, version
 
 let filter_dirs path x =
-  let st = Unix.stat (path ^ x) in
+  let st = Unix.stat (path // x) in
   st.st_kind = Unix.S_DIR && String.get x 0 <> '-';;
 
 let get_all_portage_pkgs =
-  let db_path = "/var/db/pkg/" in
   let cats = Array.to_list (Sys.readdir db_path) in
   let cats = List.filter (filter_dirs db_path) cats in
 
   let names cat =
-    let pkg (x, y) = { category = cat; name = x; version = y } in
-    let catpath = db_path ^ cat ^ "/" in
+    let pkg (_, x, y) =
+      { category = cat; name = x; version = y } in
+    let catpath = db_path // cat in
+    let lscat = Array.to_list (Sys.readdir catpath) in
+    let lscat = List.filter (filter_dirs catpath) lscat in
+    let lscat = List.map parse_pv lscat in
+    List.map pkg lscat in
+
+  let pkgs = List.map names cats in
+  List.concat pkgs
+
+let get_all_portageq_pkgs =
+  let cats = Array.to_list (Sys.readdir db_path) in
+  let cats = List.filter (filter_dirs db_path) cats in
+
+  let names cat =
+    let pkg (_, x, y) =
+      { category = cat; name = x; version = y } in
+    let catpath = db_path // cat in
     let lscat = Array.to_list (Sys.readdir catpath) in
     let lscat = List.filter (filter_dirs catpath) lscat in
     let lscat = List.map parse_pv lscat in
@@ -66,128 +101,93 @@ let get_all_portage_pkgs =
 
 let portage_pkg_of_pkg, pkg_of_portage_pkg = get_memo_functions ()
 
-let portage_pkgs = Hashtbl.create 13
+let portage_pkgs_by_name = Hashtbl.create 13
+let portage_pkgs_by_catname = Hashtbl.create 13
 let portage_pkg_of_string str =
-  if Hashtbl.length portage_pkgs == 0 then (
-    let add_pkg pkg = Hashtbl.add portage_pkgs pkg.name pkg in
-    List.iter add_pkg get_all_portage_pkgs
+  print_endline (__LOC__ ^ ": " ^ str);
+  if Hashtbl.length portage_pkgs_by_name == 0 then (
+    let add_pkg pkg =
+      Hashtbl.add portage_pkgs_by_name pkg.name pkg;
+      Hashtbl.add portage_pkgs_by_catname (pkg.category // pkg.name) pkg in
+    List.iter add_pkg get_all_portageq_pkgs
   );
-  match Hashtbl.find_opt portage_pkgs str with
-  | None -> None
+  (* Prefer searching by full name, but allow just name as well *)
+  match Hashtbl.find_opt portage_pkgs_by_catname str with
   | Some pkg -> Some (pkg_of_portage_pkg pkg)
+  | None -> (match Hashtbl.find_opt portage_pkgs_by_name str with
+      | Some pkg -> Some (pkg_of_portage_pkg pkg)
+      | None -> None)
 
-let portage_pkg_to_string pkg =
-  let portage_pkg = portage_pkg_of_pkg pkg in
-  sprintf "=%s/%s-%s" portage_pkg.category portage_pkg.name portage_pkg.version
+let portage_pkg_to_string pkg = portage_pkg_to_str @@ portage_pkg_of_pkg @@ pkg
 
-let portage_pkg_name pkg = (portage_pkg_of_pkg pkg).name
+let portage_pkg_name pkg =
+  let pkg = portage_pkg_of_pkg pkg in
+  sprintf "%s/%s" pkg.category pkg.name
 
 let portage_get_package_database_mtime () =
   (lstat "/usr/portage/metadata/timestamp").st_mtime
 
-let dpkg_get_all_requires pkgs =
-  let dpkg_requires = Hashtbl.create 13 in
-  (* Prepare dpkg_requires hashtbl with depends, pre-depends from all
-     packages. Strip version information and discard alternative
-     dependencies *)
-  let cmd = sprintf "\
-      %s --show --showformat='${Package} ${Depends} ${Pre-Depends}\n' | \
-      sed -e 's/ *([^)]*) */ /g' \
-          -e 's/ *, */ /g' \
-          -e 's/ *| *[^ ]* */ /g'"
-    Config.dpkg_query in
-  let lines = run_command_get_lines cmd in
-  List.iter (
-    fun line ->
-      match string_split " " line with
-      | [] -> ()
-      | pkgname :: [] -> ()
-      | pkgname :: deps -> Hashtbl.add dpkg_requires pkgname deps
-  ) lines;
+let portage_pkg_path pkg =
+  db_path // pkg.category // (pkg.name ^ "-" ^ pkg.version)
 
-  let get pkgs =
-    let pkgnames = List.map dpkg_package_name (PackageSet.elements pkgs) in
-    let deps = List.map (Hashtbl.find_all dpkg_requires) pkgnames in
-    let deps = List.flatten (List.flatten deps) in
-    let deps = filter_map dpkg_package_of_string deps in
-    PackageSet.union pkgs (package_set_of_list deps)
-  in
-  (* The command above only gets one level of dependencies.  We need
-   * to keep iterating until we reach a fixpoint.
-   *)
-  let rec loop pkgs =
-    let pkgs' = get pkgs in
-    if PackageSet.equal pkgs pkgs' then pkgs
-    else loop pkgs'
-  in
-  loop pkgs
-
-let dpkg_diversions = Hashtbl.create 13
-let dpkg_get_all_files pkgs =
-  if Hashtbl.length dpkg_diversions = 0 then (
-    let cmd = sprintf "%s --list" Config.dpkg_divert in
-    let lines = run_command_get_lines cmd in
-    List.iter (
-      fun line ->
-        let items = string_split " " line in
-        match items with
-        | ["diversion"; "of"; path; "to"; real_path; "by"; pkg] ->
-          Hashtbl.add dpkg_diversions path real_path
-        | _ -> ()
-    ) lines
-  );
+let find_usable atom =
   let cmd =
-    sprintf "%s --listfiles %s | grep '^/' | grep -v '^/.$' | sort -u"
-      Config.dpkg_query
-      (quoted_list (List.map dpkg_package_name_arch
-		      (PackageSet.elements pkgs))) in
-  let lines = run_command_get_lines cmd in
-  List.map (
-    fun path ->
-      let config =
-	try string_prefix "/etc/" path && (lstat path).st_kind = S_REG
-	with Unix_error _ -> false in
-      let source_path =
-        try Hashtbl.find dpkg_diversions path
-        with Not_found -> path in
-      { ft_path = path; ft_source_path = source_path; ft_config = config }
-  ) lines
+    sprintf "%s best_visible / installed %s" Config.portageq (quote atom) in
+  let out = run_command_get_lines cmd in
+  match out with
+  |[] -> None
+  |x :: [] -> Some x
+  |_ -> error "Unknown output of 'best_visible'"
 
-let dpkg_download_all_packages pkgs dir =
+let pkg_of_string str =
+  let make_pkg (x, y, z) = { category = x; name = y; version = z } in
+  pkg_of_portage_pkg @@ make_pkg @@ parse_pv @@ str
+
+let portage_get_requires pkg =
+  let ret = ref (PackageSet.add pkg PackageSet.empty) in
+  let deps = (portage_pkg_path @@ portage_pkg_of_pkg @@ pkg) // "RDEPEND" in
+  let deps = String.split_on_char ' ' @@ input_line @@ open_in @@ deps in
+  let add_pkg atom =
+    (match (find_usable atom) with
+    |None -> raise (Failure "Inconsistent system, no installed package satisfies")
+    |Some pkg ->
+      ret := PackageSet.add (pkg_of_string pkg) !ret) in
+  List.iter add_pkg deps;
+  PackageSet.iter (fun x -> print_endline (portage_pkg_to_string x)) !ret;
+  !ret
+
+let portage_get_files pkg =
+  let file_to_file_t filename =
+    let cmd = sprintf "%s is_protected / %s" Config.portageq (quote filename) in
+    let config = Sys.command cmd = 0 in
+    { ft_path = filename; ft_source_path = filename; ft_config = config } in
+  let atom = portage_pkg_to_str @@ portage_pkg_of_pkg pkg in
+  let cmd = sprintf "%s contents / %s" Config.portageq (quote atom) in
+  let files = run_command_get_lines cmd in
+  List.map file_to_file_t files
+
+let portage_download_all_packages pkgs dir =
   let tdir = !settings.tmpdir // string_random8 () in
   mkdir tdir 0o755;
 
-  let dpkgs = List.map dpkg_package_name (PackageSet.elements pkgs) in
-
-  let cmd =
-    sprintf "cd %s && %s %s download %s"
-      (quote tdir)
-      Config.apt_get
-      (if !settings.debug >= 1 then "" else " --quiet --quiet")
-      (quoted_list dpkgs) in
-  run_command cmd;
-
-  (* Unpack each downloaded package. *)
   let cmd =
     sprintf "
-umask 0000
-for f in %s/*.deb; do
-  %s --fsys-tarfile \"$f\" | (cd %s && tar xf -)
-done"
-      (quote tdir) Config.dpkg_deb (quote dir) in
+cd %s
+touch asdf.txt"
+      (quote tdir) in
   run_command cmd
 
 let () =
   let ph = {
     ph_detect = portage_detect;
-    ph_init = (fun () -> ());
+    ph_init = portage_init;
     ph_fini = (fun () -> ());
     ph_package_of_string = portage_pkg_of_string;
     ph_package_to_string = portage_pkg_to_string;
     ph_package_name = portage_pkg_name;
     ph_get_package_database_mtime = portage_get_package_database_mtime;
-    ph_get_requires = PHGetAllRequires dpkg_get_all_requires;
-    ph_get_files = PHGetAllFiles dpkg_get_all_files;
-    ph_download_package = PHDownloadAllPackages dpkg_download_all_packages;
+    ph_get_requires = PHGetRequires portage_get_requires;
+    ph_get_files = PHGetFiles portage_get_files;
+    ph_download_package = PHDownloadAllPackages portage_download_all_packages;
   } in
   register_package_handler "gentoo" "portage" ph

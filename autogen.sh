@@ -3,7 +3,8 @@
 set -e
 
 # If the submodule is not initialized run bootstrap
-if git submodule status .gnulib | grep -q '^-'; then
+if git submodule status .gnulib | grep -q '^-' ||
+   [[ ! -f lib/Makefile.am ]]; then
     ./bootstrap
 fi
 
